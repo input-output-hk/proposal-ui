@@ -20,6 +20,7 @@ import Types (Name, DialogReply)
 import UpdateLogic (InstallersResults, BucketInfo)
 
 import Iohk.Types (Environment)
+import qualified Buildkite
 
 -- | Intermediate data type for the daedalus download json file.
 data DownloadVersionInfo = DownloadVersionInfo
@@ -47,10 +48,11 @@ data DownloadVersionJson = DownloadVersionJson
 instance ToJSON DownloadVersionJson where
   toJSON (DownloadVersionJson dvis releaseNotes) = object [ "platforms" .= dvis, "release_notes" .= releaseNotes ]
 
-data MenuChoices = SetDaedalusRev | FindInstallers | SignInstallers | S3Upload | UpdateVersionJSON | RehashInstallers | SelectCluster | SetGPGUser | LocalInstallers deriving Show
+data MenuChoices = SetDaedalusRev | ChooseBuildkiteBuild | FindInstallers | SignInstallers | S3Upload | UpdateVersionJSON | RehashInstallers | SelectCluster | SetGPGUser | LocalInstallers deriving Show
 
 data ProposalUIState = ProposalUIState
   { psDaedalusRev :: Maybe String
+  , psBuildkiteBuild :: Maybe Buildkite.BuildNumber
   , psCallback :: EventM Name DialogReply
   , psMenuState :: L.List Name MenuChoices
   , psInstallers :: Maybe InstallerData
