@@ -1,6 +1,7 @@
 {-# OPTIONS_GHC -Weverything -Wno-unsafe -Wno-implicit-prelude -Wno-semigroup #-}
 {-# LANGUAGE DeriveGeneric     #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Github (
   CommitStatus(..),
@@ -10,11 +11,12 @@ module Github (
   gitHubURLParser,
   fetchGithubJson,
   fetchGithubStatus,
+  fetchGithubSha,
   Rev,
 ) where
 
-import           Data.Aeson           (FromJSON, parseJSON, withObject, (.:))
-import           Data.Aeson.Types     (Parser)
+import           Data.Aeson           (FromJSON, parseJSON, withObject, (.:), Value)
+import           Data.Aeson.Types     (Parser, parseEither)
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.Text            as T
 import           GHC.Generics         (Generic)
@@ -83,3 +85,11 @@ fetchGithubJson url = do
   -- https://developer.github.com/v3/repos/statuses/#get-the-combined-status-for-a-specific-ref
 fetchGithubStatus :: HasCallStack => Org -> Repo -> Rev -> IO CommitStatus
 fetchGithubStatus org repo rev = fetchGithubJson $ T.intercalate "/" [ "https://api.github.com/repos", org, repo, "commits", rev, "status" ]
+
+fetchGithubSha :: HasCallStack => Org -> Repo -> Rev -> IO T.Text
+fetchGithubSha org repo rev = do
+  (raw :: Value) <- fetchGithubJson $ T.intercalate "/" [ "https://api.github.com/repos", org, repo, "commits", rev ]
+  let
+    resultSha :: Either String T.Text
+    resultSha = parseEither (withObject "Commit info" (.: "sha")) raw
+  either fail pure resultSha

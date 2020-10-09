@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveGeneric, RecordWildCards, OverloadedStrings #-}
+{-# LANGUAGE DeriveGeneric, RecordWildCards, OverloadedStrings, ScopedTypeVariables #-}
 
 -- | Module for accessing selected endpoints of Buildkite API.
 
@@ -7,12 +7,18 @@
 module Buildkite.API
   ( APIToken(APIToken)
   , Artifact(artifactFilename, artifactSha1sum)
+  , BuildNumber (BuildNumber)
+  , listBuildsForCommit
   , listArtifactsForBuild
   , getArtifactURL
+  , getBuildNumber
+  , hrBuildUrl
   ) where
 
-import           Network.HTTP.Simple (Request, getResponseBody, httpJSON, setRequestPath, setRequestHost, setRequestPort, setRequestHeader, setRequestSecure, defaultRequest)
-import           Network.HTTP.Conduit (redirectCount)
+import           Network.HTTP.Types.URI (parseQuery)
+import           Network.HTTP.Types.Header (HeaderName)
+import           Network.HTTP.Simple (ResponseHeaders, Query, Response,  Header, Request, getResponseBody, httpJSON, setRequestPath, setRequestHost, setRequestPort, setRequestHeader, setRequestSecure, defaultRequest, httpNoBody, getRequestQueryString, addToRequestQueryString)
+import           Network.HTTP.Conduit (redirectCount, responseHeaders, queryString, setQueryString, parseRequest)
 import           Data.Text (Text)
 import           GHC.Generics (Generic)
 import           Data.Aeson (FromJSON(parseJSON), Value, genericParseJSON, withObject, withText, defaultOptions, (.:))
@@ -21,6 +27,21 @@ import           Network.URI (URI, parseURI)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import           Data.String (IsString(fromString))
+import Data.Foldable (find)
+import Data.Functor
+import qualified Data.Map.Strict as M
+import Control.Monad.IO.Class (MonadIO)
+import Data.Function ((&))
+
+import Data.ByteString (ByteString)
+import qualified Data.ByteString.Char8 as B
+
+import Text.Megaparsec
+import Data.Void
+import Text.Megaparsec
+import Text.Megaparsec.Char
+import qualified Text.Megaparsec.Char.Lexer as L
+
 
 ----------------------------------------------------------------------------
 -- types
@@ -32,6 +53,7 @@ newtype ID = ID { unID :: Text }
 -- | These tokens are associated with an access scope and can be
 -- generated at https://buildkite.com/user/api-access-tokens
 newtype APIToken = APIToken Text
+  deriving (Eq, Show)
 
 instance IsString APIToken where
   fromString = APIToken . T.pack
@@ -129,6 +151,55 @@ data Job = Job
 
 data ArtifactDownload = ArtifactDownload { unArtifactDownload :: Text }
 
+data BuildNumber = BuildNumber Int
+  deriving (Generic, Show, Eq, Ord)
+
+getBuildNumber :: BuildNumber -> Int
+getBuildNumber (BuildNumber bn) = bn
+
+----------------------------------------------------------------------------
+-- Parser
+
+type Parser = Parsec Void Text
+
+sc :: Parser ()
+sc = L.space space1 empty empty
+
+lexeme :: Parser a -> Parser a
+lexeme = L.lexeme sc
+
+data PageRelative = PageRelativeLast
+                  | PageRelativePrev
+                  | PageRelativeNext
+                  | PageRelativeFirst
+  deriving (Eq, Show, Ord)
+
+type URL = Text
+type PageRef = (PageRelative, URL)
+
+pPageRelative :: Parser PageRelative
+pPageRelative = do
+  _ <- string "rel=\""
+  rel <- choice
+    [ string "next"  $> PageRelativeNext
+    , string "prev"  $> PageRelativePrev
+    , string "first" $> PageRelativeFirst
+    , string "last"  $> PageRelativeLast
+    ]
+  _ <- string "\""
+  _ <- optional (char ',')
+  pure rel
+
+pPageRef :: Parser PageRef
+pPageRef = do
+  _ <- char '<'
+  url <- T.pack <$> manyTill L.charLiteral (char '>')
+  _ <- char ';'
+  _ <- sc
+  pageRel <- pPageRelative
+  _ <- sc
+  pure $ (pageRel, url)
+ 
 ----------------------------------------------------------------------------
 -- api calls
 
@@ -138,12 +209,120 @@ data ArtifactDownload = ArtifactDownload { unArtifactDownload :: Text }
 listArtifactsForBuild :: APIToken      -- ^ token generated in buildkite settings
                       -> Text          -- ^ organization slug, e.g. input-output-hk
                       -> Text          -- ^ pipeline slug, e.g. iohk-ops
-                      -> Int           -- ^ build number
+                      -> BuildNumber   -- ^ build number
                       -> IO [Artifact] -- ^ artifact data records belonging to the job
 listArtifactsForBuild t org pipeline buildNum = getResponseBody <$> httpJSON req
   where
     req = makeRequest t path
     path = buildPath org pipeline buildNum ++ [ "artifacts" ]
+
+-- | Returns list of build numbers matching commit sha (only works for
+-- full sha, not for shortened ones).
+listBuildsForCommit
+  :: APIToken
+  -- ^ Buildkite token for accessing Buildkite APIs, must have access
+  -- to read builds of desired organization/project.
+  -> Text
+  -- ^ organization slug, e.g. input-output-hk
+  -> Text
+  -- ^ pipeline slug, e.g. iohk-ops
+  -> Text
+  -- ^ SHA256 long commit hash
+  -> IO [BuildNumber]
+  -- ^ List of build numbers for commit
+listBuildsForCommit t org pipeline commit = handlePagination' t getResponseBody req
+  where
+    req =
+      makeRequest t path
+        & addToRequestQueryString ([("commit", Just . B.pack . T.unpack $ commit)])
+    path = ["organizations", org, "pipelines", pipeline, "builds"]
+
+-- | Human-friendly build URL
+hrBuildUrl
+  :: Text
+  -- ^ organization slug, e.g. input-output-hk
+  -> Text
+  -- ^ pipeline slug, e.g. iohk-ops
+  -> BuildNumber
+  -- ^ build number
+  -> Text
+  -- ^ URL of that build
+hrBuildUrl org pipeline (BuildNumber build) =
+  "https://buildkite.com/" <> T.intercalate "/" [org, pipeline, "builds", T.pack $ show build]
+
+handlePagination' :: (FromJSON body, Monoid m) => APIToken -> (Response body -> m) -> Request -> IO m
+handlePagination' token f = handlePagination httpJSON (fmap (authRequest token) . parseRequest . T.unpack) f
+
+-- hnPagination
+--   :: (Response body -> Request)
+--   -- ^ Determine next request from previous response
+--   -> m [Response]
+-- hnPagination 
+
+-- TODO:
+-- - Provide me with some way to determine next URL/queryparams
+-- - I'll return list of responses
+--
+-- - Some way to set page size
+-- - Some way to run a request
+--
+-- | Handle Buildkite API pagination.
+handlePagination
+  :: (MonadIO m, Monoid a)
+  => (Request -> m (Response body))
+  -> (Text -> m Request)
+  -> (Response body -> a)
+  -> Request
+  -> m a
+handlePagination runReq mkReq respF req = do
+  let reqBigPage = setQueryParam "per_page" (Just . B.pack . show $ buildkitePageLimit) $ req
+  loop reqBigPage
+
+  where
+    loop req = do
+      resp <- runReq req
+      let currentPage = respF resp
+      let mNextUrl = findNextPageUrl $ responseHeaders resp 
+      nextPages <- case mNextUrl of
+          Left e -> pure mempty
+          Right nextUrl -> do
+            nextReq <- mkReq nextUrl
+            loop nextReq
+      pure $ currentPage <> nextPages
+
+    setQueryParam :: ByteString -> Maybe ByteString -> Request -> Request
+    setQueryParam key val req = 
+      let
+        removeQueryParam :: ByteString -> Query -> Query
+        removeQueryParam qp = foldr (\(k, v) qps -> if k == qp then qps else (k, v) : qps) []
+
+        newQueryString = ((key, val):) . removeQueryParam key . getRequestQueryString $ req
+      in
+        setQueryString newQueryString req
+
+    findNextPageUrl :: ResponseHeaders -> Either Text Text
+    findNextPageUrl resp = 
+      let
+        findHeader :: HeaderName -> ResponseHeaders -> Maybe Header
+        findHeader hdrName = find (\(headerName, _) -> headerName == hdrName)
+
+        headerBody :: Header -> ByteString
+        headerBody = snd
+
+        linkHeader = fmap headerBody . findHeader "Link" $ resp
+      in do
+        hdr <- maybe (Left "error") (Right) $ fmap (T.pack . B.unpack) linkHeader
+        result <- either (Left . T.pack . errorBundlePretty) Right $ parse (many pPageRef) "Buildkite Respnse Link Header" hdr
+        maybe (Left "Couldn't find next page") (Right) $ M.lookup PageRelativeNext $ toPageMap result
+        -- relMap <- toPageMap <$> parse (many pPageRef) "Buildkite Respnse Link Header" hdr
+        -- M.lookup PageRelativeNext relMap 
+
+toPageMap :: [PageRef] -> M.Map PageRelative URL
+toPageMap = M.fromList
+
+-- | Buildkite API page limit https://buildkite.com/docs/apis/rest-api#pagination
+buildkitePageLimit :: Int
+buildkitePageLimit = 100
 
 -- | Returns the URL for downloading an artifact.
 -- Although the returned URL might be in our own public S3 bucket,
@@ -152,7 +331,7 @@ listArtifactsForBuild t org pipeline buildNum = getResponseBody <$> httpJSON req
 getArtifactURL :: APIToken       -- ^ token generated in buildkite settings
                -> Text           -- ^ organization slug, e.g. input-output-hk
                -> Text           -- ^ pipeline slug, e.g. iohk-ops
-               -> Int            -- ^ build number
+               -> BuildNumber    -- ^ build number
                -> Artifact       -- ^ Artifact record
                -> IO Text        -- ^ Temporary URL to download artifact from
 getArtifactURL t org pipeline buildNum Artifact{..} =
@@ -165,19 +344,22 @@ getArtifactURL t org pipeline buildNum Artifact{..} =
 ----------------------------------------------------------------------------
 -- util
 
+authRequest :: APIToken -> Request -> Request
+authRequest token = setRequestSecure True
+                    . setRequestPort 443
+                    . addAuthHeader token
+                    . addUserAgentHeader
+
 makeRequest :: APIToken -> [Text] -> Request
 makeRequest token path = setRequestPath ("/v2/" <> T.encodeUtf8 (T.intercalate "/" path))
                          $ setRequestHost "api.buildkite.com"
-                         $ setRequestSecure True
-                         $ setRequestPort 443
-                         $ addAuthHeader token
+                         $ authRequest token
                          $ setRedirectCount 0
-                         $ addUserAgentHeader
                          $ defaultRequest
 
-buildPath :: Text -> Text -> Int -> [Text]
-buildPath org pipeline num = [ "organizations", org, "pipelines", pipeline
-                             , "builds" , T.pack (show num) ]
+buildPath :: Text -> Text -> BuildNumber -> [Text]
+buildPath org pipeline (BuildNumber num) =
+  [ "organizations", org, "pipelines", pipeline, "builds" , T.pack (show num) ]
 
 addUserAgentHeader :: Request -> Request
 addUserAgentHeader = setRequestHeader "User-Agent" ["https://github.com/input-output-hk/iohk-ops"]
@@ -218,6 +400,10 @@ instance FromJSON URI where
   parseJSON = withText "URI" $ \u -> case parseURI (T.unpack u) of
     Just uri -> return uri
     Nothing -> fail "URI could not be parsed"
+
+instance FromJSON BuildNumber where
+  parseJSON = withObject "Build" $ \o -> 
+    BuildNumber <$> o .: "number"
 
 parseOptions :: String -> Options
 parseOptions prefix = defaultOptions { fieldLabelModifier = dropPrefix . camelTo2 '_' }

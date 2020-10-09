@@ -28,19 +28,12 @@ module UpdateLogic
   , hashInstallers
   ) where
 
-import           Appveyor                         (AppveyorArtifact (AppveyorArtifact),
-                                                   build, buildNumber,
-                                                   fetchAppveyorArtifacts,
-                                                   fetchAppveyorBuild,
-                                                   getArtifactUrl, jobId,
-                                                   parseCiUrl, unBuildNumber,
-                                                   unJobId)
-import qualified Appveyor
 import           Buildkite.API                    (APIToken (APIToken),
                                                    Artifact, artifactFilename,
                                                    artifactSha1sum,
                                                    listArtifactsForBuild)
 import qualified Buildkite.API                    as BK
+import qualified Buildkite
 import           Control.Applicative              ((<|>))
 import           Control.Exception                (try)
 import           Control.Lens                     (to, (^.), set, (<&>))
@@ -53,6 +46,7 @@ import qualified Data.ByteString.Lazy             as LBS
 import qualified Data.ByteString                  as BS
 import qualified Data.HashMap.Strict              as HashMap
 import           Data.List                        (find, nub)
+import           Data.Maybe                       (catMaybes)
 import           Data.Monoid                      ((<>))
 import           Data.Text                        (Text)
 import qualified Data.Text                        as T
@@ -95,6 +89,7 @@ import           Iohk.Types                            (ApplicationVersion)
 import           Utils                            (fetchCachedUrl,
                                                    fetchCachedUrlWithSHA1)
 import Arch (Arch(Win64, Linux64, Mac64), ApplicationVersionKey, formatArch)
+import Buildkite (loadBuildkiteToken)
 
 import Temp (installerHash)
 
@@ -120,7 +115,7 @@ data CIResult2 = CIFetchedResult
   , cifSha256 :: Digest SHA256
   } deriving Show
 
-data CISystem = Buildkite | AppVeyor deriving (Show, Eq, Bounded, Enum, Generic)
+data CISystem = Buildkite deriving (Show, Eq, Bounded, Enum, Generic)
 
 data InstallersResults = InstallersResults
   { ciResults    :: [CIResult2]
@@ -135,10 +130,8 @@ type InstallerPredicate = CIResult -> Bool
 -- CI system. Useful when the CI has multiple builds for a single git
 -- revision. 'Nothing' designates no filter.
 selectBuildNumberPredicate :: Maybe Int -- ^ Buildkite build number
-                           -> Maybe Int -- ^ AppVeyor build number
                            -> InstallerPredicate
-selectBuildNumberPredicate bk av =
-  installerPredicates (buildNum Buildkite bk) (buildNum AppVeyor av)
+selectBuildNumberPredicate bk = buildNum Buildkite bk
   where
     buildNum _ Nothing    _ = True
     buildNum ci (Just num) r = ciResultSystem r /= ci || ciResultBuildNumber r == num
@@ -147,55 +140,28 @@ selectBuildNumberPredicate bk av =
 installerPredicates :: InstallerPredicate -> InstallerPredicate -> InstallerPredicate
 installerPredicates p q a = p a && q a
 
--- | Read the Buildkite token from a config file. This file is not
--- checked into git, so the user needs to create it themself.
--- If the file isn't present, the program exits.
-loadBuildkiteToken :: IO (Either Text APIToken)
-loadBuildkiteToken = try (T.readFile buildkiteTokenFile) >>= \case
-  Right contents -> case process contents of
-    Just token -> pure $ Right $ APIToken token
-    Nothing -> pure $ Left $ format (st%" was empty.\n"%s) buildkiteTokenFile advice
-  Left (e :: IOError) -> die $ format ("Could not read "%st%": "%st%s)
-    buildkiteTokenFile (ioeGetErrorString e) advice
-  where
-    process = headMay . filter (not . T.null) . T.lines
-    advice = "Obtain an API access token with read_builds scope from\n" <>
-             "https://buildkite.com/user/api-access-tokens\n" <>
-             "Exiting!" :: Text
-    st = makeFormat T.pack
-
 cdnLink :: Text -> ObjectKey -> Text
 cdnLink cInstallerURLBase (ObjectKey key) = mconcat [ "https://", cInstallerURLBase, "/", key ]
 
-buildkiteTokenFile = "static/buildkite_token" :: String
-
-realFindInstallers :: InstallerPredicate -> Rev -> Turtle.FilePath -> IO (Either Text [CIResult2])
-realFindInstallers instP daedalusRev destDir = do
+realFindInstallers :: InstallerPredicate -> Buildkite.BuildNumber -> Turtle.FilePath -> IO ([CIResult2])
+realFindInstallers instP build destDir = do
   eBuildkiteToken <- liftIO $ loadBuildkiteToken
   case eBuildkiteToken of
     Right buildkiteToken -> do
-      st <- liftIO $ statuses <$> fetchGithubStatus "input-output-hk" "daedalus" daedalusRev
-      let
-        findStatus :: Status -> IO [CIResult2]
-        findStatus status = do
-          x <- findInstallersFromStatus buildkiteToken status
-          -- handleCIResults is what does the fetch
-          handleCIResults instP destDir x
-      (Right . concat) <$> mapM findStatus st
-    Left err -> pure $ Left err
+      x <- findInstallersFromStatus buildkiteToken build
+      handleCIResults instP destDir x
+    Left err -> fail $ T.unpack err
 
-getInstallersResults :: ApplicationVersionKey -> InstallerPredicate -> Rev -> Turtle.FilePath -> Managed InstallersResults
-getInstallersResults keys instP daedalusRev destDir = do
-  eciResults <- liftIO $ realFindInstallers instP daedalusRev destDir
-  case eciResults of
-    Right ciResults -> do
-      let
-        getInner :: CIResult2 -> CIResult
-        getInner CIFetchedResult{cifResult} = cifResult
-        innerResults = map getInner ciResults
-      globalResult <- findVersionInfo keys daedalusRev
-      liftIO $ validateCIResultCount innerResults
-      pure $ InstallersResults ciResults globalResult
+getInstallersResults :: ApplicationVersionKey -> InstallerPredicate -> Rev -> Buildkite.BuildNumber -> Turtle.FilePath -> Managed InstallersResults
+getInstallersResults keys instP daedalusRev build destDir = do
+  ciResults <- liftIO $ realFindInstallers instP build destDir
+  let
+    getInner :: CIResult2 -> CIResult
+    getInner CIFetchedResult{cifResult} = cifResult
+    innerResults = map getInner ciResults
+  globalResult <- findVersionInfo keys daedalusRev
+  liftIO $ validateCIResultCount innerResults
+  pure $ InstallersResults ciResults globalResult
 
 handleCIResults :: InstallerPredicate -> Turtle.FilePath -> Either Text [CIResult] -> IO [CIResult2]
 handleCIResults instP destDir (Right rs) = do
@@ -229,45 +195,23 @@ bkArtifactInstallerArch art | T.isSuffixOf ".pkg" fn = Just Mac64
                             | otherwise = Nothing
   where fn = artifactFilename art
 
-findInstallersBuildKite :: APIToken -> Int -> T.Text
-                        -> IO (Either Text [CIResult])
-findInstallersBuildKite apiToken buildNum buildUrl = do
-  let buildDesc = format ("Buildkite build #"%d) buildNum
+findInstallersBuildKite :: APIToken -> BK.BuildNumber -> IO (Either Text [CIResult])
+findInstallersBuildKite apiToken buildNum = do
+  let buildDesc = format ("Buildkite build #"%d) (BK.getBuildNumber buildNum)
   arts <- listArtifactsForBuild apiToken buildkiteOrg pipelineDaedalus buildNum
   let arts' = [ (art, arch) | (art, Just arch) <- [ (art, bkArtifactInstallerArch art) | art <- arts ] ]
   forInstallers buildDesc (const True) arts' $ \(art, arch) -> do
     -- ask Buildkite what the download URL is
+    let buildUrl = BK.hrBuildUrl buildkiteOrg pipelineDaedalus buildNum
     url <- BK.getArtifactURL apiToken buildkiteOrg pipelineDaedalus buildNum art
     pure $ CIResult
       { ciResultSystem = Buildkite
       , ciResultUrl = buildUrl
       , ciResultDownloadUrl = url
-      , ciResultBuildNumber = buildNum
+      , ciResultBuildNumber = BK.getBuildNumber buildNum
       , ciResultArch = arch
       , ciResultSHA1Sum = (Just $ artifactSha1sum art)
       , ciResultFilename = FP.fromText (artifactFilename art)
-      }
-
-avArtifactIsInstaller :: AppveyorArtifact -> Bool
-avArtifactIsInstaller (AppveyorArtifact _ name) = name == "Daedalus Win64 Installer"
-
-findInstallersAppVeyor :: Text
-                       -> Appveyor.Username -> Appveyor.Project -> ApplicationVersion
-                       -> IO (Either Text [CIResult])
-findInstallersAppVeyor url user project version = do
-  appveyorBuild <- fetchAppveyorBuild user project version
-  let jobid = appveyorBuild ^. build . Appveyor.jobs . to head . jobId
-      jobDesc = format ("AppVeyor job "%s) (unJobId jobid)
-  artifacts <- fetchAppveyorArtifacts jobid
-  forInstallers jobDesc avArtifactIsInstaller artifacts $ \(AppveyorArtifact art _) ->
-    pure CIResult
-      { ciResultSystem      = AppVeyor
-      , ciResultUrl         = url
-      , ciResultDownloadUrl = getArtifactUrl jobid art
-      , ciResultBuildNumber = appveyorBuild ^. build . buildNumber . to unBuildNumber
-      , ciResultArch        = Win64
-      , ciResultSHA1Sum     = Nothing
-      , ciResultFilename    = filename (FP.fromText art)
       }
 
 -- | Download artifacts into the nix store.
@@ -356,16 +300,13 @@ printInstallersResults InstallersResults{..} = T.putStr $ T.unlines
   where
     rule = "============================================================" :: Text
 
-data StatusContext = StatusContextAppveyor Appveyor.Username Appveyor.Project ApplicationVersion
-                   | StatusContextBuildkite Text Int
+data StatusContext = StatusContextBuildkite Text Int
                    deriving (Show, Eq)
 
 parseStatusContext :: Status -> Maybe StatusContext
-parseStatusContext status = parseAppveyor <|> parseBuildKite
+parseStatusContext status = parseBuildKite
   where
-    parseAppveyor = guard isAppveyor >> pure (StatusContextAppveyor user project version)
-      where (user, project, version) = parseCiUrl $ targetUrl status
-    parseBuildKite, parseAppveyor :: Maybe StatusContext
+    parseBuildKite :: Maybe StatusContext
     parseBuildKite = guard isBuildkite >> do
       let parts = T.splitOn "/" (context status)
       repo <- headMay . tail $ parts
@@ -374,17 +315,15 @@ parseStatusContext status = parseAppveyor <|> parseBuildKite
       buildNum <- readMay . T.unpack $ lastPart
       pure $ StatusContextBuildkite repo buildNum
 
-    isAppveyor = context status == "continuous-integration/appveyor/branch"
     isBuildkite = "buildkite/" `T.isPrefixOf` context status
 
-findInstallersFromStatus :: BK.APIToken -> Status -> IO (Either Text [CIResult])
-findInstallersFromStatus buildkiteToken status =
-  case parseStatusContext status of
-    Just (StatusContextBuildkite _repo buildNum) ->
-      findInstallersBuildKite buildkiteToken buildNum (targetUrl status)
-    Just (StatusContextAppveyor user project version) ->
-      findInstallersAppVeyor (targetUrl status) user project version
-    Nothing -> pure $ Left $ "unrecognized CI status: " <> context status
+findInstallersFromStatus :: BK.APIToken -> Buildkite.BuildNumber -> IO (Either Text [CIResult])
+findInstallersFromStatus buildkiteToken build = findInstallersBuildKite buildkiteToken build
+
+findBuildkiteRepoBuildNum :: Status -> Maybe (Text, Int)
+findBuildkiteRepoBuildNum status = case parseStatusContext status of
+  Just (StatusContextBuildkite repo buildNum) -> pure (repo, buildNum)
+  _                                           -> Nothing
 
 githubWikiRecord :: InstallersResults -> Text
 githubWikiRecord InstallersResults{..} = T.intercalate " | " cols <> "\n"

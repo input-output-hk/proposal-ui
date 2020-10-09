@@ -21,8 +21,9 @@ executable proposal-ui
   main-is:             Test.hs
   ghc-options:         -threaded -Weverything -Wno-implicit-prelude -Wno-missing-local-signatures -Wno-missing-exported-signatures -Wno-unsafe
   other-modules:       PromptString
-                     , Appveyor
+                     , PromptChoice
                      , Arch
+                     , Buildkite
                      , Buildkite.API
                      , Cardano
                      , Dialog1
@@ -48,6 +49,8 @@ executable proposal-ui
                      , async
                      , brick
                      , bytestring
+                     , microlens
+                     , microlens-th
                      , cassava
                      , cborg
                      , containers
@@ -65,6 +68,7 @@ executable proposal-ui
                      , lens
                      , lens-aeson
                      , managed
+                     , megaparsec
                      , memory
                      , mtl
                      , network-uri

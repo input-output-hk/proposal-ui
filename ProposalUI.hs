@@ -4,6 +4,7 @@
 
 module ProposalUI (spawnProposalUI) where
 
+import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as T
 import           Data.Maybe (isJust, fromJust)
@@ -16,6 +17,8 @@ import qualified Data.ByteString.Lazy.Char8 as L8
 import           Data.Aeson (Value, encode, toJSON, eitherDecodeFileStrict')
 import qualified Filesystem.Path.CurrentOS        as FP
 import           System.Directory (listDirectory, createDirectoryIfMissing)
+import           Data.Ord (comparing, Down(Down))
+import           Data.List (sortBy)
 
 import Brick (Widget, BrickEvent(VtyEvent), EventM, vBox, str, strWrap, txt, padLeftRight)
 import qualified Graphics.Vty as V
@@ -26,6 +29,7 @@ import qualified Data.Vector as V
 
 import Types (Dialog(Dialog, dRender, dHandleEvent), AppState, Name(Menu1), DialogReply(DialogReplyContinue, DialogReplyLiftIO), CustomEvent)
 import PromptString (spawnPromptString)
+import PromptChoice (spawnPromptChoice)
 
 import Iohk.Types (Environment(Testnet, Development, Staging, Production, Nightly, ITNBC, ITNRW, MainnetFlight, ShelleyTestnet))
 import Arch (Arch(Win64, Mac64, Linux64), ArchMap, archMapEach, idArchMap, archMapFromList, archMap, lookupArch)
@@ -35,24 +39,27 @@ import UpdateLogic (InstallersResults(globalResult, ciResults, InstallersResults
                    , CISystem(Buildkite)
                    , updateVersionJson, runAWS', uploadHashedInstaller, uploadSignature, hashInstallers)
 import InstallerVersions (GlobalResults(GlobalResults, grCardanoCommit, grDaedalusCommit, grApplicationVersion, grNodeVersion, grCardanoVersion, grDaedalusVersion), installerNetwork, InstallerNetwork(InstallerTestnet, InstallerStaging, InstallerMainnet, InstallerNightly, InstallerITNBC, InstallerITNRW, InstallerMainnetFlight, InstallerShelleyTestnet))
-import Github (Rev)
+import Github (Rev, fetchGithubSha)
+import Buildkite (loadBuildkiteToken, listBuildsForCommit)
 import Utils (tt)
 
-import ProposalUI.Types (ProposalUIState(psDownloadVersionInfo,psMenuState,psDaedalusRev,psInstallers,psEnvironment,psBucket,psGPGUser,ProposalUIState,psOutputDir,psCallback)
-                        , MenuChoices(SetGPGUser, SelectCluster, SetDaedalusRev, FindInstallers, SignInstallers, S3Upload, UpdateVersionJSON, RehashInstallers, LocalInstallers)
+import ProposalUI.Types (ProposalUIState(psDownloadVersionInfo,psMenuState,psDaedalusRev,psBuildkiteBuild,psInstallers,psEnvironment,psBucket,psGPGUser,ProposalUIState,psOutputDir,psCallback)
+                        , MenuChoices(SetGPGUser, SelectCluster, SetDaedalusRev, ChooseBuildkiteBuild , FindInstallers, SignInstallers, S3Upload, UpdateVersionJSON, RehashInstallers, LocalInstallers)
                         , InstallerData(InstallerData, idResults), DownloadVersionInfo(DownloadVersionInfo, dviVersion, dviURL, dviHash, dviSignature, dviSHA256)
                         , DownloadVersionJson(DownloadVersionJson), ClusterConfig(ccBucket, ccBucketURL, ccEnvironment))
 
 import FileChooser (spawnFileChooser)
+import qualified Buildkite
 
 mkProposalUI :: ProposalUIState -> Dialog
 mkProposalUI state = Dialog { dRender = renderUI state, dHandleEvent = handleEvents state }
 
 generateNewMenu :: ProposalUIState -> L.List Name MenuChoices
-generateNewMenu ProposalUIState{psDaedalusRev,psInstallers,psDownloadVersionInfo} = L.list Menu1 (V.fromList thelist) 1
+generateNewMenu ProposalUIState{psDaedalusRev,psInstallers,psDownloadVersionInfo,psBuildkiteBuild} = L.list Menu1 (V.fromList thelist) 1
   where
-    thelist = [ SetGPGUser, SelectCluster, SetDaedalusRev ] <> maybeFindInstallers <> maybeSign <> maybeUpload <> maybeSetVersion
-    maybeFindInstallers = if (isJust psDaedalusRev) then [ FindInstallers, LocalInstallers ] else []
+    thelist = [ SetGPGUser, SelectCluster, SetDaedalusRev ] <> maybeChooseBuildkiteBuild <> maybeFindInstallers <> maybeSign <> maybeUpload <> maybeSetVersion
+    maybeChooseBuildkiteBuild = if (isJust psDaedalusRev) then [ ChooseBuildkiteBuild ] else []
+    maybeFindInstallers = if (isJust psBuildkiteBuild) then [ FindInstallers, LocalInstallers ] else []
     maybeSign = if (isJust psInstallers) then [ RehashInstallers, SignInstallers ] else []
     maybeUpload = if (isJust psInstallers) then [ S3Upload ] else []
     maybeSetVersion = if (isJust psDownloadVersionInfo) then [ UpdateVersionJSON ] else []
@@ -96,17 +103,18 @@ renderUI ProposalUIState{psMenuState,psInstallers,psDaedalusRev,psDownloadVersio
     menu :: Widget Name
     menu = B.borderWithLabel (str "Menu") $ padLeftRight 1 $ L.renderList renderRow True psMenuState
     renderRow :: Bool -> MenuChoices -> Widget Name
-    renderRow _ SetGPGUser = str "1: Set GPG User (optional)"
-    renderRow _ SelectCluster = str "2: Select Cluster"
-    renderRow _ SetDaedalusRev = str "3: Set Daedalus Revision"
-    renderRow _ FindInstallers = str "4a: Find Installers"
-    renderRow _ LocalInstallers = str "4b: use local installers in installers/"
-    renderRow _ RehashInstallers = str "5: Rehash installer (optional)"
-    renderRow _ SignInstallers = str "6: Sign installers with GPG (optional)"
-    renderRow _ S3Upload = str "7: Upload Installers to S3"
-    renderRow _ UpdateVersionJSON = str "8: Set daedalus-latest-version.json"
+    renderRow _ SetGPGUser           = str "1: Set GPG User (optional)"
+    renderRow _ SelectCluster        = str "2: Select Cluster"
+    renderRow _ SetDaedalusRev       = str "3: Set Daedalus Revision"
+    renderRow _ ChooseBuildkiteBuild = str "4: Choose Buildkite build"
+    renderRow _ FindInstallers       = str "5a: Find Installers"
+    renderRow _ LocalInstallers      = str "5b: use local installers in installers/"
+    renderRow _ RehashInstallers     = str "6: Rehash installer (optional)"
+    renderRow _ SignInstallers       = str "7: Sign installers with GPG (optional)"
+    renderRow _ S3Upload             = str "8: Upload Installers to S3"
+    renderRow _ UpdateVersionJSON    = str "9: Set daedalus-latest-version.json"
 
-configurationKeys :: Environment -> Arch -> T.Text
+configurationKeys :: Environment -> Arch -> Text
 configurationKeys Production Win64   = "mainnet_wallet_win64"
 configurationKeys Production Mac64   = "mainnet_wallet_macos64"
 configurationKeys Production Linux64 = "mainnet_wallet_linux64"
@@ -121,7 +129,7 @@ configurationKeys env' _ = error $ "Application versions not used in '" <> show 
 -- | Step 2a. (Optional) Sign installers with GPG. This will leave
 -- .asc files next to the installers which will be picked up in the
 -- upload S3 step.
-updateProposalSignInstallers :: InstallersResults -> Maybe T.Text -> IO ()
+updateProposalSignInstallers :: InstallersResults -> Maybe Text -> IO ()
 updateProposalSignInstallers InstallersResults{ciResults} userId = do
   mapM_ signInstaller $ map cifLocal $ ciResults
   where
@@ -148,15 +156,14 @@ installerForEnv env = matchNet . installerNetwork . ciResultFilename
           Development    -> True
           _              -> False
 
-findInstallers :: Turtle.FilePath -> Environment -> Rev -> IO InstallerData
-findInstallers destDir env rev = do
+findInstallers :: Turtle.FilePath -> Environment -> Rev -> Buildkite.BuildNumber -> IO InstallerData
+findInstallers destDir env daedalusRev build = do
   let
     bkNum = Nothing
-    avNum = Nothing
     instP :: InstallerPredicate
-    instP = installerPredicates (installerForEnv env) (selectBuildNumberPredicate bkNum avNum)
+    instP = installerPredicates (installerForEnv env) (selectBuildNumberPredicate bkNum)
     thing2 :: Managed InstallersResults
-    thing2 = getInstallersResults (configurationKeys env) instP rev destDir
+    thing2 = getInstallersResults (configurationKeys env) instP daedalusRev build destDir
   installerResults <- with thing2 pure
   print installerResults
   pure $ InstallerData installerResults
@@ -173,7 +180,7 @@ updateProposalUploadS3 bucket InstallerData{idResults} = do
     dvis = makeDownloadVersionInfo idResults resultMap urls signatures
   pure dvis
 
-updateVersionJSON :: BucketInfo -> ArchMap DownloadVersionInfo -> IO T.Text
+updateVersionJSON :: BucketInfo -> ArchMap DownloadVersionInfo -> IO Text
 updateVersionJSON bucket dvis = do
   let
     blob = createVersionJSON dvis
@@ -186,7 +193,7 @@ createVersionJSON dvis = do
     v = downloadVersionInfoObject dvis cfgReleaseNotes
   encode v
 
-uploadInstallers :: BucketInfo -> InstallersResults -> Shell (ArchMap T.Text)
+uploadInstallers :: BucketInfo -> InstallersResults -> Shell (ArchMap Text)
 uploadInstallers bucket res = runAWS' $ forResults res upload
   where
     upload _arch ci = do
@@ -199,7 +206,7 @@ uploadInstallers bucket res = runAWS' $ forResults res upload
 forResults :: MonadIO io => InstallersResults -> (Arch -> CIResult2 -> io b) -> io (ArchMap b)
 forResults rs action = needCIResult rs >>= archMapEach action
 
-uploadResultSignature :: BucketInfo -> CIResult2 -> IO (Maybe T.Text)
+uploadResultSignature :: BucketInfo -> CIResult2 -> IO (Maybe Text)
 uploadResultSignature bucket res = maybeReadFile sigFile >>= \case
   Just sig -> do
     runAWS' $ uploadSignature bucket sigFile
@@ -226,7 +233,7 @@ needCIResult = archMapEach need . groupResults
     need _arch (r:_) = pure r
 
 -- | Slurp in previously created signatures.
-uploadSignatures :: BucketInfo -> InstallersResults -> Shell (ArchMap (Maybe T.Text))
+uploadSignatures :: BucketInfo -> InstallersResults -> Shell (ArchMap (Maybe Text))
 uploadSignatures bucket irs = fmap join . archMapFromList <$> mapM uploadSig (ciResults irs)
   where
     uploadSig res = do
@@ -239,17 +246,17 @@ mergeObjects (Object a) (Object b) = Object (a <> b)
 mergeObjects _ b                   = b-}
 
 -- | Splat version info to an aeson object.
-downloadVersionInfoObject :: ArchMap DownloadVersionInfo  -> Maybe T.Text -> Value
+downloadVersionInfoObject :: ArchMap DownloadVersionInfo  -> Maybe Text -> Value
 downloadVersionInfoObject dvis releaseNotes = newFormat
   where
     newFormat :: Value
     newFormat = toJSON (DownloadVersionJson dvis releaseNotes)
     {-legacy :: Value
     legacy = (Object . HM.fromList . concat . map (uncurry toObject) . archMapToList) dvis
-    toObject :: Arch -> DownloadVersionInfo -> [ (T.Text, Value) ]
+    toObject :: Arch -> DownloadVersionInfo -> [ (Text, Value) ]
     toObject arch DownloadVersionInfo{dviVersion,dviURL,dviHash,dviSignature,dviSHA256} = attrs
       where
-        attrs :: [ (T.Text, Value) ]
+        attrs :: [ (Text, Value) ]
         attrs = [ (keyPrefix arch <> k, String v) | (k, v) <-
                     [ (""         , dviVersion)
                     , ("URL"      , dviURL)
@@ -263,8 +270,8 @@ downloadVersionInfoObject dvis releaseNotes = newFormat
 
 makeDownloadVersionInfo :: InstallersResults
                         -> ArchMap CIResult2
-                        -> ArchMap T.Text         -- ^ Download URLS
-                        -> ArchMap (Maybe T.Text) -- ^ GPG Signatures
+                        -> ArchMap Text         -- ^ Download URLS
+                        -> ArchMap (Maybe Text) -- ^ GPG Signatures
                         -> ArchMap DownloadVersionInfo
 makeDownloadVersionInfo InstallersResults{globalResult} resultMap urls sigs = archMap dvi
   where
@@ -288,7 +295,7 @@ rehashInstallers InstallerData{idResults} = do
   pure $ InstallerData $ InstallersResults rehashed (globalResult idResults)
 
 handleEvents :: ProposalUIState -> AppState -> BrickEvent Name CustomEvent -> EventM Name DialogReply
-handleEvents pstate@ProposalUIState{psMenuState,psDaedalusRev,psInstallers,psOutputDir,psDownloadVersionInfo,psBucket,psGPGUser,psEnvironment} _astate event = do
+handleEvents pstate@ProposalUIState{psMenuState,psDaedalusRev,psBuildkiteBuild,psInstallers,psOutputDir,psDownloadVersionInfo,psBucket,psGPGUser,psEnvironment} _astate event = do
   let
     isValidRevision :: String -> Bool
     isValidRevision = all isValidChar
@@ -316,11 +323,37 @@ handleEvents pstate@ProposalUIState{psMenuState,psDaedalusRev,psInstallers,psOut
               state1 = pstate { psDaedalusRev = Just rev, psInstallers = Nothing }
               state2 = state1 { psMenuState = generateNewMenu state1 }
             pure $ DialogReplyContinue $ mkProposalUI state2
+          ChooseBuildkiteBuild ->
+            let
+              getBuilds :: Text -> IO [Buildkite.BuildNumber]
+              getBuilds daedalusRev = do
+                sha <- fetchGithubSha "input-output-hk" "daedalus" daedalusRev
+                resultToken <- loadBuildkiteToken
+                case resultToken of
+                  Left e -> fail . T.unpack $ e
+                  Right token -> do
+                    putStrLn $ "Retrieving Buildkite builds for commit: " <> show sha
+                    Buildkite.listBuildsForCommit token "input-output-hk" "daedalus" sha
+            in
+              pure $ DialogReplyLiftIO $ do
+                let
+                  daedalusRev = T.pack $ fromJust psDaedalusRev :: Text
+
+                  sortDesc :: [Buildkite.BuildNumber] -> [Buildkite.BuildNumber]
+                  sortDesc = sortBy (comparing Down)
+                bs <- sortDesc <$> getBuilds daedalusRev
+                pure $ spawnPromptChoice "Build" (Buildkite.getBuildNumber <$> bs) $ \case
+                  Nothing    -> pure . DialogReplyContinue . mkProposalUI $ pstate
+                  Just build -> do
+                    let
+                      state1 = pstate { psBuildkiteBuild = Just (Buildkite.BuildNumber build), psInstallers = Nothing }
+                      state2 = state1 { psMenuState = generateNewMenu state1 }
+                    pure . DialogReplyContinue . mkProposalUI $ state2
           FindInstallers -> do
             let
               act :: IO Dialog
               act = do
-                res <- findInstallers psOutputDir psEnvironment (T.pack $ fromJust psDaedalusRev)
+                res <- findInstallers psOutputDir psEnvironment (T.pack . fromJust $ psDaedalusRev) (fromJust psBuildkiteBuild)
                 let
                   state1 = pstate { psInstallers = Just res }
                   state2 = state1 { psMenuState = generateNewMenu state1 }
@@ -328,11 +361,11 @@ handleEvents pstate@ProposalUIState{psMenuState,psDaedalusRev,psInstallers,psOut
             pure $ DialogReplyLiftIO act
           LocalInstallers -> do
             let
-              nameToArch :: T.Text -> Arch
+              nameToArch :: Text -> Arch
               nameToArch fn | T.isSuffixOf ".pkg" fn = Mac64
                             | T.isSuffixOf ".bin" fn = Linux64
                             | T.isSuffixOf ".exe" fn = Win64
-              fileToResult :: T.Text -> IO CIResult2
+              fileToResult :: Text -> IO CIResult2
               fileToResult name = do
                 print "fileToResult"
                 print name
@@ -423,10 +456,10 @@ spawnProposalUI callback = do
     yearMonthDay = formatTime defaultTimeLocale (iso8601DateFormat Nothing) now
     destDir = "proposal-cluster-" <> yearMonthDay
     bucket = BucketInfo "proposal-ui-test" "proposal-ui-test.s3.amazonaws.com"
-    gpgUser :: Maybe T.Text
+    gpgUser :: Maybe Text
     gpgUser = Nothing
     state' :: ProposalUIState
-    state' = ProposalUIState (Nothing) callback undefined Nothing (fromString destDir) Nothing bucket gpgUser ITNRW
+    state' = ProposalUIState (Nothing) Nothing callback undefined Nothing (fromString destDir) Nothing bucket gpgUser ITNRW
     menu = generateNewMenu state'
     state = state' { psMenuState = menu }
   pure $ mkProposalUI state
