@@ -241,7 +241,8 @@ findInstallersBuildKite apiToken buildNum buildUrl = do
   let buildDesc = format ("Buildkite build #"%d) buildNum
   arts <- listArtifactsForBuild apiToken buildkiteOrg pipelineDaedalus buildNum
   let arts' = [ (art, arch) | (art, Just arch) <- [ (art, bkArtifactInstallerArch art) | art <- arts ] ]
-  forInstallers buildDesc (const True) arts' $ \(art, arch) -> do
+  let filterOutAarch64 = \(art, _) -> not ("aarch64" `T.isInfixOf` artifactFilename art)
+  forInstallers buildDesc filterOutAarch64 arts' $ \(art, arch) -> do
     -- ask Buildkite what the download URL is
     url <- BK.getArtifactURL apiToken buildkiteOrg pipelineDaedalus buildNum art
     pure $ CIResult
