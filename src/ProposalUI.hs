@@ -27,14 +27,14 @@ import qualified Data.Vector as V
 import Types (Dialog(Dialog, dRender, dHandleEvent), AppState, Name(Menu1), DialogReply(DialogReplyContinue, DialogReplyLiftIO), CustomEvent)
 import PromptString (spawnPromptString)
 
-import Iohk.Types (Environment(Testnet, Development, Staging, Production, Nightly, ITNBC, ITNRW, MainnetFlight, ShelleyTestnet, MainnetCatalyst))
+import Iohk.Types (Environment(Testnet, Preview, Preprod, Development, Staging, Production, Nightly, ITNBC, ITNRW, MainnetFlight, ShelleyTestnet, MainnetCatalyst))
 import Arch (Arch(Win64, Mac64, Linux64), ArchMap, archMapEach, idArchMap, archMapFromList, archMap, lookupArch)
 import UpdateLogic (InstallersResults(globalResult, ciResults, InstallersResults), CIResult2(CIFetchedResult, cifBlakeCbor, cifLocal, cifSha256, cifResult)
                    , CIResult(CIResult, ciResultUrl, ciResultDownloadUrl, ciResultBuildNumber, ciResultArch, ciResultFilename, ciResultSystem, ciResultSHA1Sum)
                    , InstallerPredicate, BucketInfo(BucketInfo, biBucket), installerPredicates, selectBuildNumberPredicate, getInstallersResults
                    , CISystem(Buildkite)
                    , updateVersionJson, runAWS', uploadHashedInstaller, uploadSignature, hashInstallers)
-import InstallerVersions (GlobalResults(GlobalResults, grCardanoCommit, grDaedalusCommit, grApplicationVersion, grNodeVersion, grCardanoVersion, grDaedalusVersion), installerNetwork, InstallerNetwork(InstallerTestnet, InstallerStaging, InstallerMainnet, InstallerNightly, InstallerITNBC, InstallerITNRW, InstallerMainnetFlight, InstallerShelleyTestnet, InstallerMainnetCatalyst))
+import InstallerVersions (GlobalResults(GlobalResults, grCardanoCommit, grDaedalusCommit, grApplicationVersion, grNodeVersion, grCardanoVersion, grDaedalusVersion), installerNetwork, InstallerNetwork(InstallerTestnet, InstallerPreview, InstallerPreprod, InstallerStaging, InstallerMainnet, InstallerNightly, InstallerITNBC, InstallerITNRW, InstallerMainnetFlight, InstallerShelleyTestnet, InstallerMainnetCatalyst))
 import Github (Rev)
 import Utils (tt)
 
@@ -143,6 +143,8 @@ installerForEnv env = matchNet . installerNetwork . ciResultFilename
           ITNRW          -> n == Just InstallerITNRW
           Staging        -> n == Just InstallerStaging
           Testnet        -> n == Just InstallerTestnet
+          Preview        -> n == Just InstallerPreview
+          Preprod        -> n == Just InstallerPreprod
           MainnetFlight  -> n == Just InstallerMainnetFlight
           ShelleyTestnet -> n == Just InstallerShelleyTestnet
           MainnetCatalyst -> n == Just InstallerMainnetCatalyst

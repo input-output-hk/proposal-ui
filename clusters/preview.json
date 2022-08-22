@@ -1,0 +1,5 @@
+{
+  "bucket":"updates-cardano-preview",
+  "bucket-url":"updates-cardano-preview.s3.amazonaws.com",
+  "environment":"Preview"
+}

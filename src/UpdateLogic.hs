@@ -88,7 +88,7 @@ import           Turtle                           (MonadIO, d, die, format, fp, 
 import System.IO (stdout)
 
 import           InstallerVersions                (GlobalResults (GlobalResults, grApplicationVersion, grCardanoCommit, grCardanoVersion, grDaedalusCommit, grDaedalusVersion),
-                                                   InstallerNetwork (InstallerMainnet, InstallerStaging, InstallerTestnet),
+                                                   InstallerNetwork (InstallerMainnet, InstallerStaging, InstallerTestnet, InstallerPreview, InstallerPreprod),
                                                    findVersionInfo,
                                                    installerNetwork)
 import           Iohk.Types                            (ApplicationVersion)
@@ -241,7 +241,8 @@ findInstallersBuildKite apiToken buildNum buildUrl = do
   let buildDesc = format ("Buildkite build #"%d) buildNum
   arts <- listArtifactsForBuild apiToken buildkiteOrg pipelineDaedalus buildNum
   let arts' = [ (art, arch) | (art, Just arch) <- [ (art, bkArtifactInstallerArch art) | art <- arts ] ]
-  forInstallers buildDesc (const True) arts' $ \(art, arch) -> do
+  let filterOutAarch64 = \(art, _) -> not ("aarch64" `T.isInfixOf` artifactFilename art)
+  forInstallers buildDesc filterOutAarch64 arts' $ \(art, arch) -> do
     -- ask Buildkite what the download URL is
     url <- BK.getArtifactURL apiToken buildkiteOrg pipelineDaedalus buildNum art
     pure $ CIResult
@@ -332,6 +333,8 @@ formatCIResults rs = T.unlines $ ["CI links:"] ++ ciLinks
                      ++ [""] ++ instLinks InstallerMainnet
                      ++ [""] ++ instLinks InstallerStaging
                      ++ [""] ++ instLinks InstallerTestnet
+                     ++ [""] ++ instLinks InstallerPreview
+                     ++ [""] ++ instLinks InstallerPreprod
   where
     getInner :: CIResult2 -> CIResult
     getInner CIFetchedResult{cifResult} = cifResult

@@ -34,6 +34,8 @@ data GlobalResults = GlobalResults {
 data InstallerNetwork = InstallerMainnet
                       | InstallerStaging
                       | InstallerTestnet
+                      | InstallerPreview
+                      | InstallerPreprod
                       | InstallerNightly
                       | InstallerITNBC
                       | InstallerITNRW
@@ -46,6 +48,8 @@ instance Show InstallerNetwork where
   show InstallerMainnet         = "Mainnet"
   show InstallerStaging         = "Staging"
   show InstallerTestnet         = "Testnet"
+  show InstallerPreview         = "Preview"
+  show InstallerPreprod         = "Preprod"
   show InstallerNightly         = "Nightly"
   show InstallerITNBC           = "Incentivized Balance Check"
   show InstallerMainnetFlight   = "Mainnet Flight"
@@ -146,6 +150,8 @@ installerNetwork fpath | "mainnet-flight" `T.isInfixOf` name = Just InstallerMai
                        | "staging" `T.isInfixOf` name = Just InstallerStaging
                        | "shelley_testnet" `T.isInfixOf` name = Just InstallerShelleyTestnet
                        | "testnet" `T.isInfixOf` name = Just InstallerTestnet
+                       | "preview" `T.isInfixOf` name = Just InstallerPreview
+                       | "preprod" `T.isInfixOf` name = Just InstallerPreprod
                        | "itn_balance_check" `T.isInfixOf` name = Just InstallerITNBC
                        | "itn_rewards_v1" `T.isInfixOf` name = Just InstallerITNRW
                        | "nightly" `T.isInfixOf` name = Just InstallerNightly

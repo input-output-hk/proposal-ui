@@ -1,0 +1,5 @@
+{
+  "bucket":"updates-cardano-preprod",
+  "bucket-url":"updates-cardano-preprod.s3.amazonaws.com",
+  "environment":"Preprod"
+}

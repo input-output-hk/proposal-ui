@@ -25,6 +25,8 @@ data Environment
   | Production
   | Staging
   | Testnet
+  | Preview
+  | Preprod
   | Development
   | DevOps
   | Nightly

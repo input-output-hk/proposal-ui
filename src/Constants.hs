@@ -139,6 +139,8 @@ envSettings env =
                                , (Faucet,         All, "deployments/cardano-faucet-env-testnet.nix")
                                , (Monitoring,     All, "deployments/monitoring-env-testnet.nix")
                                ] <> deplAgnosticFiles}
+    Preview -> error "is this used anymore?"
+    Preprod -> error "is this used anymore?"
     Development -> EnvSettings
       { envDeployerUser      = "staging"
       , envDefaultConfigurationKey = "devnet"
